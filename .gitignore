@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.log
+*.pyc
+.vercel
+refs/custom_*
+refs/in_*
+engines.json
+speeds.json
