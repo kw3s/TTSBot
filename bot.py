@@ -28,7 +28,7 @@ import urllib.request
 import uuid
 import wave
 
-from tts import get_api_key, synthesize
+from tts import create_voice_model, get_api_key, get_voice_model, synthesize
 
 TG_API = "https://api.telegram.org"
 MAX_CHUNK = 900          # characters per synthesis request
@@ -56,7 +56,49 @@ DATA_DIR = "/tmp/fish-tts" if SERVERLESS else SCRIPT_DIR
 REF_DIR = os.path.join(DATA_DIR, "refs")   # writable custom-voice refs
 ENGINES_FILE = os.path.join(DATA_DIR, "engines.json")
 SPEEDS_FILE = os.path.join(DATA_DIR, "speeds.json")
+STATE_FILE = os.path.join(DATA_DIR, "voice_state.json")
 PENDING_VOICE = set()    # chat_ids waiting to record a reference clip
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as fh:
+        json.dump(state, fh)
+
+
+def get_fish_voice(chat_id):
+    return load_state().get("fish_voice", {}).get(str(chat_id))
+
+
+def set_fish_voice(chat_id, model_id):
+    state = load_state()
+    if model_id:
+        state.setdefault("fish_voice", {})[str(chat_id)] = model_id
+    else:
+        state.get("fish_voice", {}).pop(str(chat_id), None)
+    save_state(state)
+
+
+def itts_active(chat_id):
+    return bool(load_state().get("itts_active", {}).get(str(chat_id)))
+
+
+def set_itts_active(chat_id, active):
+    state = load_state()
+    state.setdefault("itts_active", {})[str(chat_id)] = bool(active)
+    save_state(state)
+
+
+def last_clone(chat_id):
+    return load_state().get("last", {}).get(str(chat_id), {})
 
 
 def ffmpeg_bin():
@@ -273,7 +315,9 @@ def set_engine(chat_id, name):
 
 def custom_ref(chat_id):
     path = os.path.join(REF_DIR, f"custom_{chat_id}.wav")
-    return path if os.path.exists(path) else BUNDLED_REF
+    if os.path.exists(path) and itts_active(chat_id):
+        return path
+    return BUNDLED_REF
 
 
 def get_speed(chat_id):
@@ -360,9 +404,16 @@ def handle_message(token, api_key, model, voice, msg):
                   "<b>Engines</b>\n"
                   "/engine - show current engine\n"
                   "/engine fish - Fish Audio s2.1 (free, fast)\n"
-                  f"/engine itts - IndexTTS-2.5 voice clone ({ITT_MAX_CHUNKS * MAX_CHUNK // 3} chars max)\n"
-                  "/setvoice - clone a custom voice: attach or send a "
-                  "voice message right after this command (~10s of clean speech)\n"
+                  f"/engine itts - IndexTTS-2.5 voice clone ({ITT_MAX_CHUNKS * MAX_CHUNK // 3} chars max)\n\n"
+                  "<b>Voice cloning</b>\n"
+                  "/clone - send a voice message after this (~5-30s clean "
+                  "speech); I'll clone it on BOTH engines and send samples\n"
+                  "/usefish [id] - make the last clone (or a fish.audio model "
+                  "id) your active Fish voice\n"
+                  "/useitts - make the last clone your active IndexTTS voice\n"
+                  "/useboth - activate the last clone on both engines\n"
+                  "/voices - show active voices\n"
+                  "/resetvoice - back to defaults (Sarah / Rick Warren)\n"
                   "/cancel - abort pending voice setup")
         elif cmd == "/engine":
             parts = text_in.split(maxsplit=1)
@@ -375,10 +426,12 @@ def handle_message(token, api_key, model, voice, msg):
                 name = "itts" if parts[1].strip().lower().startswith("i") else "fish"
                 set_engine(chat_id, name)
                 ref_note = ""
-                if name == "itts" and not os.path.exists(
-                        os.path.join(REF_DIR, f"custom_{chat_id}.wav")):
+                if name == "itts" and not (
+                        os.path.exists(
+                            os.path.join(REF_DIR, f"custom_{chat_id}.wav"))
+                        and itts_active(chat_id)):
                     ref_note = ("\nHeads-up: you're on the default sample voice. "
-                                "/setvoice to clone your own.")
+                                "/clone to clone your own.")
                 reply(token, chat_id, f"Engine set to <b>{name}</b>.{ref_note}")
             else:
                 reply(token, chat_id, "Unknown engine. Use /engine fish or /engine itts")
@@ -399,11 +452,74 @@ def handle_message(token, api_key, model, voice, msg):
                     return
                 set_speed(chat_id, v)
                 reply(token, chat_id, f"Speed factor set to <b>{v}</b> (itts engine only).")
-        elif cmd == "/setvoice":
+        elif cmd in ("/clone", "/setvoice"):
             PENDING_VOICE.add(chat_id)
             reply(token, chat_id,
-                  "Send me a voice message or audio clip now - about 5-30 seconds "
-                  "of clean speech from the person to clone.\n/cancel to abort.")
+                  "Send me a voice message or audio clip now - about 5-30 "
+                  "seconds of clean speech from the person to clone.\n"
+                  "I'll clone it on both engines and send you samples, then "
+                  "you choose which to activate.\n/cancel to abort.")
+        elif cmd == "/usefish":
+            parts = text_in.split(maxsplit=1)
+            if len(parts) > 1:
+                model_id = parts[1].strip()
+                try:
+                    info = get_voice_model(api_key, model_id)
+                except Exception as exc:
+                    reply(token, chat_id,
+                          f"Couldn't find that fish.audio model: {exc}")
+                    return
+                set_fish_voice(chat_id, model_id)
+                reply(token, chat_id,
+                      f"Fish voice set to <b>{info.get('title', model_id)}</b>.")
+            else:
+                clone = last_clone(chat_id)
+                if not clone.get("fish_id"):
+                    reply(token, chat_id,
+                          "No recent clone. Send /clone first, or use "
+                          "/usefish &lt;model_id&gt;.")
+                    return
+                set_fish_voice(chat_id, clone["fish_id"])
+                reply(token, chat_id,
+                      f"Fish voice set to your clone <b>{clone.get('title', clone['fish_id'])}</b>.")
+        elif cmd == "/useitts":
+            pending_ref = os.path.join(REF_DIR, f"pending_{chat_id}.wav")
+            if not os.path.exists(pending_ref):
+                reply(token, chat_id, "No recent clone. Send /clone first.")
+                return
+            custom_path = os.path.join(REF_DIR, f"custom_{chat_id}.wav")
+            shutil.copyfile(pending_ref, custom_path)
+            set_itts_active(chat_id, True)
+            reply(token, chat_id,
+                  "<b>IndexTTS voice activated</b> - send /engine itts to use it.")
+        elif cmd == "/useboth":
+            parts = text_in.split(maxsplit=1)
+            clone = last_clone(chat_id)
+            if clone.get("fish_id"):
+                set_fish_voice(chat_id, clone["fish_id"])
+            pending_ref = os.path.join(REF_DIR, f"pending_{chat_id}.wav")
+            if os.path.exists(pending_ref):
+                shutil.copyfile(pending_ref,
+                                os.path.join(REF_DIR, f"custom_{chat_id}.wav"))
+                set_itts_active(chat_id, True)
+            if not clone.get("fish_id") and not os.path.exists(pending_ref):
+                reply(token, chat_id, "No recent clone. Send /clone first.")
+                return
+            reply(token, chat_id, "<b>Clone activated on both engines.</b>")
+        elif cmd == "/voices":
+            fv = get_fish_voice(chat_id)
+            itts_note = (f"your clone ({ITT_SPACE})" if itts_active(chat_id)
+                         else f"default ({os.path.basename(BUNDLED_REF)})")
+            engine = get_engine(chat_id)
+            reply(token, chat_id,
+                  f"Engine: <b>{engine}</b>\n"
+                  f"Fish voice: <b>{fv or 'Sarah (default)'}</b>\n"
+                  f"IndexTTS ref: <b>{itts_note}</b>")
+        elif cmd == "/resetvoice":
+            set_fish_voice(chat_id, None)
+            set_itts_active(chat_id, False)
+            reply(token, chat_id,
+                  "Back to defaults: Sarah (fish) / Rick Warren (itts).")
         elif cmd == "/cancel":
             PENDING_VOICE.discard(chat_id)
             reply(token, chat_id, "Okay, cancelled.")
@@ -411,9 +527,10 @@ def handle_message(token, api_key, model, voice, msg):
             reply(token, chat_id, "Unknown command. Try /help")
         return
 
-    # custom-voice capture
+    # custom-voice capture: clone on both engines, send samples
     if chat_id in PENDING_VOICE and (msg.get("voice") or msg.get("audio")):
         src = msg.get("voice") or msg.get("audio")
+        PENDING_VOICE.discard(chat_id)
         try:
             ffmpeg = ffmpeg_bin()
             if not ffmpeg:
@@ -423,18 +540,79 @@ def handle_message(token, api_key, model, voice, msg):
             tmp_in = os.path.join(REF_DIR, f"in_{chat_id}.bin")
             with open(tmp_in, "wb") as fh:
                 fh.write(raw_bytes)
-            out_path = os.path.join(REF_DIR, f"custom_{chat_id}.wav")
+            pending_ref = os.path.join(REF_DIR, f"pending_{chat_id}.wav")
             subprocess.run([ffmpeg, "-y", "-loglevel", "error",
-                            "-i", tmp_in, "-ar", "22050", "-ac", "1", out_path],
+                            "-i", tmp_in, "-ar", "22050", "-ac", "1",
+                            pending_ref],
                            check=True, timeout=120)
             os.remove(tmp_in)
-            PENDING_VOICE.discard(chat_id)
-            reply(token, chat_id,
-                  "Voice saved! I'll use it for IndexTTS from now on. "
-                  "Make sure /engine is set to itts.")
         except Exception as exc:
             log(traceback.format_exc())
             reply(token, chat_id, f"Couldn't process that audio: {exc}")
+            return
+
+        started = time.time()
+        sample_text = ("Hi there. This is your brand new cloned voice, "
+                       "reading a short sample so you can hear how it sounds.")
+        state = load_state()
+        state.setdefault("last", {})[str(chat_id)] = {
+            "title": f"clone-{chat_id}-{time.strftime('%Y%m%d')}",
+            "ref": pending_ref,
+        }
+
+        fish_id = None
+        fish_state = None
+        try:
+            with open(pending_ref, "rb") as fh:
+                wav_bytes = fh.read()
+            info = create_voice_model(
+                api_key, wav_bytes,
+                title=f"TTSBot-{chat_id}-{time.strftime('%Y%m%d%H%M')}")
+            fish_id = info.get("_id")
+            fish_state = info.get("state")
+            state["last"][str(chat_id)]["fish_id"] = fish_id
+            save_state(state)
+            log(f"fish model created {fish_id} (state={fish_state})")
+        except Exception as exc:
+            log(traceback.format_exc())
+            reply(token, chat_id, f"Fish cloning failed: {exc}")
+
+        if fish_id:
+            try:
+                if fish_state not in (None, "trained", "created"):
+                    raise RuntimeError(f"model state is '{fish_state}'")
+                audio, _used = synthesize_full(sample_text, api_key, model,
+                                               fish_id)
+                send_audio(token, chat_id, audio,
+                           "[fish-clone] sample - /usefish to activate "
+                           "this voice", "mp3")
+            except Exception as exc:
+                log(traceback.format_exc())
+                reply(token, chat_id,
+                      f"Fish clone saved ({fish_id}) but the sample failed: "
+                      f"{exc}. Try /usefish later.")
+
+        elapsed = time.time() - started
+        if SERVERLESS and elapsed > 40:
+            reply(token, chat_id,
+                  "IndexTTS sample skipped (GPU queue too slow for the 60s "
+                  "serverless window). The reference is stored - /useitts to "
+                  "activate it, then just send text.")
+        else:
+            try:
+                audio, _used = synthesize_full_itts(sample_text, pending_ref)
+                send_audio(token, chat_id, audio,
+                           "[itts-clone] sample - /useitts to activate "
+                           "this voice", "wav")
+            except Exception as exc:
+                log(traceback.format_exc())
+                reply(token, chat_id,
+                      f"IndexTTS cloning failed: {exc}. Fish side is unaffected.")
+
+        reply(token, chat_id,
+              "<b>Done!</b> Activate with /usefish, /useitts, /useboth, "
+              "or /voices to check what's active. /resetvoice reverts to "
+              "Sarah / Rick Warren.")
         return
 
     doc = msg.get("document")
@@ -487,10 +665,13 @@ def handle_message(token, api_key, model, voice, msg):
                 source_text, custom_ref(chat_id), speed=get_speed(chat_id))
             fmt = "wav"
         else:
-            audio, used = synthesize_full(source_text, api_key, model, voice)
+            chat_voice = get_fish_voice(chat_id) or voice
+            audio, used = synthesize_full(source_text, api_key, model,
+                                          chat_voice)
             fmt = "mp3"
-    except SystemExit:
-        raise
+    except SystemExit as exc:
+        # tts.py's CLI paths call sys.exit(); convert so the webhook survives
+        raise RuntimeError(f"TTS engine failed (exit {exc.code})") from None
     except Exception as exc:
         log(traceback.format_exc())
         msg_str = str(exc)

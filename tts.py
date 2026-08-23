@@ -19,6 +19,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 
 API_URL = "https://api.fish.audio/v1/tts"
 VALID_FORMATS = ("mp3", "wav", "opus", "pcm")
@@ -190,6 +191,66 @@ def synthesize(text, api_key, model, voice, audio_format, speed, lang):
     except urllib.error.URLError as exc:
         print(f"error: cannot reach {API_URL}: {exc.reason}", file=sys.stderr)
         sys.exit(1)
+
+
+def create_voice_model(api_key, wav_bytes, title):
+    """Clone a voice on fish.audio from wav bytes.
+
+    Returns the raw model dict ({'_id', 'state', ...}). Raises RuntimeError
+    instead of sys.exit so callers can decide how to surface failures.
+    """
+    boundary = "fishtts" + uuid.uuid4().hex
+    parts = []
+    for key, value in (
+        ("type", "tts"),
+        ("title", title),
+        ("train_mode", "fast"),
+        ("visibility", "private"),
+    ):
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'
+        )
+    parts.append(
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="voices"; '
+        'filename="reference.wav"\r\nContent-Type: audio/wav\r\n\r\n'
+    )
+    body = "".join(parts).encode("utf-8") + wav_bytes + \
+        f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        "https://api.fish.audio/model",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        raise RuntimeError(f"model create failed: HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"cannot reach api.fish.audio: {exc.reason}")
+
+
+def get_voice_model(api_key, model_id):
+    req = urllib.request.Request(
+        f"https://api.fish.audio/model/{model_id}",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        raise RuntimeError(f"model lookup failed: {exc}")
 
 
 def play_audio(path, player_cmd):
