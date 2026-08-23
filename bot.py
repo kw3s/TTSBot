@@ -35,7 +35,10 @@ MAX_CHUNK = 900          # characters per synthesis request
 POLL_TIMEOUT = 50
 ITT_SPACE = os.environ.get("INDEX_TTS_SPACE", "D300274/IndexTTS-2.5-Demo")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BUNDLED_REF = os.path.join(SCRIPT_DIR, "refs", "voice_01.wav")
+BUNDLED_REF = os.environ.get("ITTS_DEFAULT_REF") or os.path.join(
+    SCRIPT_DIR, "refs", "voice_01.wav")
+if not os.path.isabs(BUNDLED_REF):
+    BUNDLED_REF = os.path.join(SCRIPT_DIR, BUNDLED_REF)
 SERVERLESS = bool(os.environ.get("VERCEL"))
 
 
@@ -248,11 +251,12 @@ def synthesize_full_itts(text, ref_path, lang="EN", speed=1.0):
 # ---------- engine preference (per chat) ----------
 
 def get_engine(chat_id):
+    fallback = os.environ.get("DEFAULT_ENGINE", "fish")
     try:
         with open(ENGINES_FILE) as fh:
-            return json.load(fh).get(str(chat_id), "fish")
+            return json.load(fh).get(str(chat_id)) or fallback
     except Exception:
-        return "fish"
+        return fallback
 
 
 def set_engine(chat_id, name):
