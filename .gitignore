@@ -7,3 +7,6 @@ refs/custom_*
 refs/in_*
 engines.json
 speeds.json
+
+.vercel
+.env*.local

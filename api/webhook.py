@@ -8,11 +8,13 @@ app = Flask(__name__)
 
 
 @app.route("/", methods=["GET", "HEAD"])
+@app.route("/api/webhook", methods=["GET", "HEAD"])
 def health():
     return jsonify(ok=True, service="fish-tts-bot")
 
 
 @app.route("/", methods=["POST"])
+@app.route("/api/webhook", methods=["POST"])
 def webhook():
     secret = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     if secret and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
