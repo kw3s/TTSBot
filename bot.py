@@ -12,6 +12,7 @@ Run:
     python3 bot.py
 """
 
+import auk
 import base64
 import io
 import json
@@ -52,6 +53,12 @@ def _cap(default_value, env_name):
 # serverless invocations must finish inside Vercel's maxDuration, so cap work
 MAX_CHUNKS = _cap(8 if SERVERLESS else 30, "FISH_MAX_CHUNKS")
 ITT_MAX_CHUNKS = _cap(1 if SERVERLESS else 6, "ITTS_MAX_CHUNKS")
+AUK_MAX_CHUNKS = _cap(1 if SERVERLESS else 4, "AUK_MAX_CHUNKS")
+# AuK runs on a ZeroGPU Space with a per-request budget, so keep chunks short
+# (~300 chars is roughly 20 s of speech) instead of the 900 used for fish.
+AUK_CHUNK = _cap(300, "AUK_CHUNK")
+AUK_VARIANT = os.environ.get("AUK_VARIANT", "flash")
+AUK_USE_PE = os.environ.get("AUK_USE_PE", "").strip().lower() in ("1", "true", "yes")
 DATA_DIR = "/tmp/fish-tts" if SERVERLESS else SCRIPT_DIR
 REF_DIR = os.path.join(DATA_DIR, "refs")   # writable custom-voice refs
 ENGINES_FILE = os.path.join(DATA_DIR, "engines.json")
@@ -94,6 +101,16 @@ def itts_active(chat_id):
 def set_itts_active(chat_id, active):
     state = load_state()
     state.setdefault("itts_active", {})[str(chat_id)] = bool(active)
+    save_state(state)
+
+
+def auk_active(chat_id):
+    return bool(load_state().get("auk_active", {}).get(str(chat_id)))
+
+
+def set_auk_active(chat_id, active):
+    state = load_state()
+    state.setdefault("auk_active", {})[str(chat_id)] = bool(active)
     save_state(state)
 
 
@@ -145,18 +162,18 @@ def download_doc(token, file_id):
         return resp.read()
 
 
-def split_text(text):
+def split_text(text, max_len=MAX_CHUNK):
     """Split into synthesis-friendly chunks at sentence boundaries."""
     pieces = [p for p in re.split(r"(?<=[.!?;。！？])\s+|\n{2,}", text.strip()) if p]
     chunks, cur = [], ""
     for piece in pieces:
-        while len(piece) > MAX_CHUNK:
+        while len(piece) > max_len:
             if cur:
                 chunks.append(cur)
                 cur = ""
-            chunks.append(piece[:MAX_CHUNK])
-            piece = piece[MAX_CHUNK:]
-        if cur and len(cur) + len(piece) + 1 > MAX_CHUNK:
+            chunks.append(piece[:max_len])
+            piece = piece[max_len:]
+        if cur and len(cur) + len(piece) + 1 > max_len:
             chunks.append(cur)
             cur = piece
         else:
@@ -290,6 +307,32 @@ def synthesize_full_itts(text, ref_path, lang="EN", speed=1.0):
     return concat_wavs(parts), len(chunks)
 
 
+# ---------- AuK engine (official Tencent-Hunyuan Space) ----------
+
+def synthesize_auk_chunk(text, ref_path, speed=1.0):
+    """One AuK request. The instruction carries the text (zero-shot template),
+    and the reference clip drives the cloned voice."""
+    instruction = f'Say the following with the same voice: "{text}"'
+    return auk.generate(
+        instruction,
+        ref_path=ref_path,
+        variant=AUK_VARIANT,
+        use_pe=AUK_USE_PE,
+        gen_seconds=auk.estimate_seconds(text, speed),
+    )
+
+
+def synthesize_full_auk(text, ref_path, speed=1.0):
+    chunks = split_text(text, AUK_CHUNK)[:AUK_MAX_CHUNKS]
+    parts = []
+    for i, chunk in enumerate(chunks, 1):
+        log(f"auk chunk {i}/{len(chunks)}")
+        parts.append(synthesize_auk_chunk(chunk, ref_path, speed))
+    if len(parts) == 1:
+        return parts[0], 1
+    return concat_wavs(parts), len(chunks)
+
+
 # ---------- engine preference (per chat) ----------
 
 def get_engine(chat_id):
@@ -315,7 +358,7 @@ def set_engine(chat_id, name):
 
 def custom_ref(chat_id):
     path = os.path.join(REF_DIR, f"custom_{chat_id}.wav")
-    if os.path.exists(path) and itts_active(chat_id):
+    if os.path.exists(path) and (itts_active(chat_id) or auk_active(chat_id)):
         return path
     return BUNDLED_REF
 
@@ -404,14 +447,16 @@ def handle_message(token, api_key, model, voice, msg):
                   "<b>Engines</b>\n"
                   "/engine - show current engine\n"
                   "/engine fish - Fish Audio s2.1 (free, fast)\n"
-                  f"/engine itts - IndexTTS-2.5 voice clone ({ITT_MAX_CHUNKS * MAX_CHUNK // 3} chars max)\n\n"
+                  f"/engine itts - IndexTTS-2.5 voice clone ({ITT_MAX_CHUNKS * MAX_CHUNK // 3} chars max)\n"
+                  f"/engine auk - Tencent AuK voice clone ({AUK_MAX_CHUNKS * AUK_CHUNK // 3} chars max)\n\n"
                   "<b>Voice cloning</b>\n"
                   "/clone - send a voice message after this (~5-30s clean "
                   "speech); I'll clone it on BOTH engines and send samples\n"
                   "/usefish [id] - make the last clone (or a fish.audio model "
                   "id) your active Fish voice\n"
                   "/useitts - make the last clone your active IndexTTS voice\n"
-                  "/useboth - activate the last clone on both engines\n"
+                  "/useauk - make the last clone your active AuK voice\n"
+                  "/useboth - activate the last clone on every engine\n"
                   "/voices - show active voices\n"
                   "/resetvoice - back to defaults (Sarah / Rick Warren)\n"
                   "/cancel - abort pending voice setup")
@@ -421,20 +466,23 @@ def handle_message(token, api_key, model, voice, msg):
                 cur = get_engine(chat_id)
                 reply(token, chat_id,
                       f"Current engine: <b>{cur}</b>.\n"
-                      "Switch with /engine fish or /engine itts")
-            elif parts[1].strip().lower() in ("fish", "itts", "indextts"):
-                name = "itts" if parts[1].strip().lower().startswith("i") else "fish"
+                      "Switch with /engine fish, /engine itts or /engine auk")
+            elif parts[1].strip().lower() in ("fish", "itts", "indextts", "auk"):
+                want = parts[1].strip().lower()
+                name = "itts" if want.startswith("i") else ("auk" if want.startswith("a") else "fish")
                 set_engine(chat_id, name)
                 ref_note = ""
-                if name == "itts" and not (
-                        os.path.exists(
-                            os.path.join(REF_DIR, f"custom_{chat_id}.wav"))
-                        and itts_active(chat_id)):
+                has_custom = os.path.exists(os.path.join(REF_DIR, f"custom_{chat_id}.wav"))
+                if name == "itts" and not (has_custom and itts_active(chat_id)):
                     ref_note = ("\nHeads-up: you're on the default sample voice. "
                                 "/clone to clone your own.")
+                if name == "auk" and not (has_custom and auk_active(chat_id)):
+                    ref_note = ("\nHeads-up: you're on the default sample voice. "
+                                "/clone then /useauk to clone your own.")
                 reply(token, chat_id, f"Engine set to <b>{name}</b>.{ref_note}")
             else:
-                reply(token, chat_id, "Unknown engine. Use /engine fish or /engine itts")
+                reply(token, chat_id,
+                      "Unknown engine. Use /engine fish, /engine itts or /engine auk")
         elif cmd == "/speed":
             parts = text_in.split(maxsplit=1)
             if len(parts) == 1:
@@ -492,6 +540,15 @@ def handle_message(token, api_key, model, voice, msg):
             set_itts_active(chat_id, True)
             reply(token, chat_id,
                   "<b>IndexTTS voice activated</b> - send /engine itts to use it.")
+        elif cmd == "/useauk":
+            pending_ref = os.path.join(REF_DIR, f"pending_{chat_id}.wav")
+            if not os.path.exists(pending_ref):
+                reply(token, chat_id, "No recent clone. Send /clone first.")
+                return
+            shutil.copyfile(pending_ref, os.path.join(REF_DIR, f"custom_{chat_id}.wav"))
+            set_auk_active(chat_id, True)
+            reply(token, chat_id,
+                  "<b>AuK voice activated</b> - send /engine auk to use it.")
         elif cmd == "/useboth":
             parts = text_in.split(maxsplit=1)
             clone = last_clone(chat_id)
@@ -502,24 +559,29 @@ def handle_message(token, api_key, model, voice, msg):
                 shutil.copyfile(pending_ref,
                                 os.path.join(REF_DIR, f"custom_{chat_id}.wav"))
                 set_itts_active(chat_id, True)
+                set_auk_active(chat_id, True)
             if not clone.get("fish_id") and not os.path.exists(pending_ref):
                 reply(token, chat_id, "No recent clone. Send /clone first.")
                 return
-            reply(token, chat_id, "<b>Clone activated on both engines.</b>")
+            reply(token, chat_id, "<b>Clone activated on every engine.</b>")
         elif cmd == "/voices":
             fv = get_fish_voice(chat_id)
             itts_note = (f"your clone ({ITT_SPACE})" if itts_active(chat_id)
                          else f"default ({os.path.basename(BUNDLED_REF)})")
+            auk_note = (f"your clone ({auk.SPACE})" if auk_active(chat_id)
+                        else f"default ({os.path.basename(BUNDLED_REF)})")
             engine = get_engine(chat_id)
             reply(token, chat_id,
                   f"Engine: <b>{engine}</b>\n"
                   f"Fish voice: <b>{fv or 'Sarah (default)'}</b>\n"
-                  f"IndexTTS ref: <b>{itts_note}</b>")
+                  f"IndexTTS ref: <b>{itts_note}</b>\n"
+                  f"AuK ref: <b>{auk_note}</b>")
         elif cmd == "/resetvoice":
             set_fish_voice(chat_id, None)
             set_itts_active(chat_id, False)
+            set_auk_active(chat_id, False)
             reply(token, chat_id,
-                  "Back to defaults: Sarah (fish) / Rick Warren (itts).")
+                  "Back to defaults on every engine (Sarah / Rick Warren).")
         elif cmd == "/cancel":
             PENDING_VOICE.discard(chat_id)
             reply(token, chat_id, "Okay, cancelled.")
@@ -609,10 +671,20 @@ def handle_message(token, api_key, model, voice, msg):
                 reply(token, chat_id,
                       f"IndexTTS cloning failed: {exc}. Fish side is unaffected.")
 
+            try:
+                audio, _used = synthesize_full_auk(sample_text, pending_ref)
+                send_audio(token, chat_id, audio,
+                           "[auk-clone] sample - /useauk to activate "
+                           "this voice", "wav")
+            except Exception as exc:
+                log(traceback.format_exc())
+                reply(token, chat_id,
+                      f"AuK cloning failed: {exc}. Other engines are unaffected.")
+
         reply(token, chat_id,
-              "<b>Done!</b> Activate with /usefish, /useitts, /useboth, "
-              "or /voices to check what's active. /resetvoice reverts to "
-              "Sarah / Rick Warren.")
+              "<b>Done!</b> Activate with /usefish, /useitts, /useauk, "
+              "/useboth, or /voices to check what's active. /resetvoice "
+              "reverts every engine to its default.")
         return
 
     doc = msg.get("document")
@@ -646,6 +718,10 @@ def handle_message(token, api_key, model, voice, msg):
         max_chunks = ITT_MAX_CHUNKS
         limit_note = (f"That's ~{total_chunks} chunks but IndexTTS can only do "
                       f"{ITT_MAX_CHUNKS} per request - I'll read the first part only.")
+    elif engine == "auk":
+        max_chunks = AUK_MAX_CHUNKS
+        limit_note = (f"That's ~{total_chunks} chunks but AuK can only do "
+                      f"{AUK_MAX_CHUNKS} per request - I'll read the first part only.")
     else:
         max_chunks = MAX_CHUNKS
         limit_note = (f"That's ~{total_chunks} chunks but I can only do "
@@ -664,6 +740,10 @@ def handle_message(token, api_key, model, voice, msg):
             audio, used = synthesize_full_itts(
                 source_text, custom_ref(chat_id), speed=get_speed(chat_id))
             fmt = "wav"
+        elif engine == "auk":
+            audio, used = synthesize_full_auk(
+                source_text, custom_ref(chat_id), speed=get_speed(chat_id))
+            fmt = "wav"
         else:
             chat_voice = get_fish_voice(chat_id) or voice
             audio, used = synthesize_full(source_text, api_key, model,
@@ -675,10 +755,13 @@ def handle_message(token, api_key, model, voice, msg):
     except Exception as exc:
         log(traceback.format_exc())
         msg_str = str(exc)
-        if "quota" in msg_str.lower():
+        low = msg_str.lower()
+        if "quota" in low or "zerogpu" in low or "runs limit" in low:
             reply(token, chat_id,
-                  "Daily ZeroGPU quota is used up - it resets 24h after your "
-                  "first GPU use today. /engine fish meanwhile?")
+                  "AuK/IndexTTS GPU quota is used up for today (the HF Space "
+                  "runs on shared ZeroGPU). It resets ~24h after your first GPU "
+                  "use today. /engine fish still works, and /engine auk will "
+                  "come back on its own.")
         else:
             reply(token, chat_id, f"Synthesis failed: {msg_str[:300]}")
         return
