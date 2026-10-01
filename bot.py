@@ -581,6 +581,7 @@ def handle_message(token, api_key, model, voice, msg):
     text_in = msg.get("text", "").strip()
     if text_in.startswith("/"):
         cmd = text_in.split()[0].split("@")[0]
+        log(f"  command {cmd} (chat {chat_id})")
         if cmd in ("/start", "/help"):
             reply(token, chat_id,
                   "<b>fish-tts bot</b>\n"
@@ -630,7 +631,8 @@ def handle_message(token, api_key, model, voice, msg):
             if len(parts) == 1:
                 reply(token, chat_id,
                       f"Current speed factor: <b>{get_speed(chat_id)}</b> "
-                      "(1.0 = normal, higher = slower, range 0.5-2.0). "
+                      "(1.0 = normal, higher = slower, range 0.5-2.0, "
+                      "applies to IndexTTS and AuK). "
                       "Try: /speed 1.15")
             else:
                 try:
@@ -641,7 +643,8 @@ def handle_message(token, api_key, model, voice, msg):
                     reply(token, chat_id, "Give me a number between 0.5 and 2.0, e.g. /speed 1.15")
                     return
                 set_speed(chat_id, v)
-                reply(token, chat_id, f"Speed factor set to <b>{v}</b> (itts engine only).")
+                reply(token, chat_id, f"Speed factor set to <b>{v}</b> "
+                                      "(IndexTTS and AuK; fish ignores it).")
         elif cmd in ("/clone", "/setvoice"):
             PENDING_VOICE.add(chat_id)
             reply(token, chat_id,
@@ -874,6 +877,7 @@ def handle_message(token, api_key, model, voice, msg):
     else:
         truncated = False
 
+    log(f"  synthesizing engine={engine} chars={len(source_text)}")
     reply(token, chat_id, f"One sec {user}, synthesizing {label} ({engine})...")
     call_tg(token, "sendChatAction", {"chat_id": chat_id, "action": "record_voice"})
 
@@ -954,10 +958,18 @@ def process_update(update):
 
     msg = update.get("message")
     if not msg:
+        log(f"update {update.get('update_id')}: no message payload, ignored")
         return
     uid = update.get("update_id")
     if uid is not None and seen_before(uid):
+        log(f"update {uid}: already handled (Telegram retry), skipped")
         return
+    kind = next((k for k in ("text", "voice", "audio", "document", "video",
+                             "photo", "sticker", "contact", "location")
+                 if msg.get(k)), "other")
+    preview = (msg.get("text") or msg.get("caption") or "")[:60]
+    log(f"update {uid} chat={msg.get('chat', {}).get('id')} "
+        f"kind={kind} {preview!r}")
     try:
         handle_message(token, api_key, model, voice, msg)
     except SystemExit:
