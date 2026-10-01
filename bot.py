@@ -69,11 +69,7 @@ PENDING_VOICE = set()    # chat_ids waiting to record a reference clip
 
 
 def load_state():
-    try:
-        with open(STATE_FILE) as fh:
-            return json.load(fh)
-    except Exception:
-        return {}
+    return read_json(STATE_FILE, {})
 
 
 # Vercel kills the whole invocation at maxDuration, and the GPU Spaces can sit
@@ -115,10 +111,130 @@ def ensure_parent(path):
         os.makedirs(parent, exist_ok=True)
 
 
+# ---------- durable state ----------
+# Each serverless instance gets a fresh /tmp, so anything under DATA_DIR
+# evaporates between cold starts: engine choice, speed, cloned-voice refs. When
+# a Blob store is configured we keep the JSON in Blob and treat /tmp as a cache.
+BLOB_TOKEN = os.environ.get("BLOB_READ_WRITE_TOKEN")
+BLOB_BASE = "https://blob.vercel-storage.com"
+BLOB_PREFIX = os.environ.get("BLOB_STATE_PREFIX", "state")
+
+
+def _blob_url(name):
+    return f"{BLOB_BASE}/{BLOB_PREFIX}/{name}"
+
+
+# Blob reads are served from the store's own domain, not the API host (the API
+# host 404s on GET), so resolve it once per instance and remember it.
+_BLOB_STORE_BASE = None
+_BLOB_CACHE = {}          # name -> (fetched_at, data)
+_BLOB_TTL = float(os.environ.get("BLOB_CACHE_TTL", "30"))
+
+
+def _remember_store_base(url):
+    global _BLOB_STORE_BASE
+    parts = (url or "").split("/")
+    if len(parts) >= 3 and parts[2].endswith("blob.vercel-storage.com"):
+        _BLOB_STORE_BASE = "/".join(parts[:3])
+
+
+def _blob_store_base():
+    global _BLOB_STORE_BASE
+    if _BLOB_STORE_BASE is not None:
+        return _BLOB_STORE_BASE or None
+    _BLOB_STORE_BASE = ""
+    try:
+        req = urllib.request.Request(
+            f"{BLOB_BASE}/?limit=1",
+            headers={"authorization": f"Bearer {BLOB_TOKEN}",
+                     "x-api-version": "7"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            for item in (json.load(resp).get("blobs") or []):
+                _remember_store_base(item.get("url"))
+                if _BLOB_STORE_BASE:
+                    break
+    except Exception:
+        pass
+    return _BLOB_STORE_BASE or None
+
+
+def _blob_read(name):
+    """Parsed JSON from Blob, or None when missing or unreachable."""
+    now = time.time()
+    cached = _BLOB_CACHE.get(name)
+    if cached and now - cached[0] < _BLOB_TTL:
+        return cached[1]
+    base = _blob_store_base()
+    if not base:
+        return None
+    try:
+        req = urllib.request.Request(
+            f"{base}/{BLOB_PREFIX}/{name}",
+            headers={"authorization": f"Bearer {BLOB_TOKEN}"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.load(resp)
+        _BLOB_CACHE[name] = (now, data)
+        return data
+    except Exception:
+        return None
+
+
+def _blob_write(name, data):
+    """Best-effort durable write; the /tmp copy stays as a fallback."""
+    try:
+        req = urllib.request.Request(
+            _blob_url(name), data=json.dumps(data).encode(), method="PUT",
+            headers={
+                "authorization": f"Bearer {BLOB_TOKEN}",
+                "x-api-version": "7",
+                "x-content-type": "application/json",
+                "x-add-random-suffix": "0",
+                "x-allow-overwrite": "1",
+            })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            try:
+                _remember_store_base(json.load(resp).get("url"))
+            except Exception:
+                pass
+        _BLOB_CACHE[name] = (time.time(), data)
+        return True
+    except Exception as exc:
+        log(f"blob write failed for {name}: {exc}")
+        return False
+
+
+def read_json(path, default):
+    """Blob is the source of truth when configured, /tmp is the cache."""
+    if BLOB_TOKEN:
+        data = _blob_read(os.path.basename(path))
+        if isinstance(data, (dict, list)):
+            try:
+                ensure_parent(path)
+                with open(path, "w") as fh:
+                    json.dump(data, fh)
+            except Exception:
+                pass
+            return data
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def write_json(path, data):
+    try:
+        ensure_parent(path)
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+    except Exception as exc:
+        log(f"local state write failed for {path}: {exc}")
+    if BLOB_TOKEN:
+        _blob_write(os.path.basename(path), data)
+
+
 def save_state(state):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as fh:
-        json.dump(state, fh)
+    write_json(STATE_FILE, state)
 
 
 def get_fish_voice(chat_id):
@@ -377,24 +493,13 @@ def synthesize_full_auk(text, ref_path, speed=1.0):
 
 def get_engine(chat_id):
     fallback = os.environ.get("DEFAULT_ENGINE", "fish")
-    try:
-        with open(ENGINES_FILE) as fh:
-            return json.load(fh).get(str(chat_id)) or fallback
-    except Exception:
-        return fallback
+    return read_json(ENGINES_FILE, {}).get(str(chat_id)) or fallback
 
 
 def set_engine(chat_id, name):
-    data = {}
-    try:
-        with open(ENGINES_FILE) as fh:
-            data = json.load(fh)
-    except Exception:
-        pass
+    data = read_json(ENGINES_FILE, {})
     data[str(chat_id)] = name
-    ensure_parent(ENGINES_FILE)
-    with open(ENGINES_FILE, "w") as fh:
-        json.dump(data, fh)
+    write_json(ENGINES_FILE, data)
 
 
 def custom_ref(chat_id):
@@ -406,26 +511,18 @@ def custom_ref(chat_id):
 
 def get_speed(chat_id):
     try:
-        with open(SPEEDS_FILE) as fh:
-            v = float(json.load(fh)[str(chat_id)])
-            if 0.5 <= v <= 2.0:
-                return v
+        v = float(read_json(SPEEDS_FILE, {})[str(chat_id)])
+        if 0.5 <= v <= 2.0:
+            return v
     except Exception:
         pass
     return 1.0
 
 
 def set_speed(chat_id, value):
-    data = {}
-    try:
-        with open(SPEEDS_FILE) as fh:
-            data = json.load(fh)
-    except Exception:
-        pass
+    data = read_json(SPEEDS_FILE, {})
     data[str(chat_id)] = value
-    ensure_parent(SPEEDS_FILE)
-    with open(SPEEDS_FILE, "w") as fh:
-        json.dump(data, fh)
+    write_json(SPEEDS_FILE, data)
 
 
 def send_audio(token, chat_id, audio, caption, fmt="mp3"):
