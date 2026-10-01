@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -73,6 +74,45 @@ def load_state():
             return json.load(fh)
     except Exception:
         return {}
+
+
+# Vercel kills the whole invocation at maxDuration, and the GPU Spaces can sit
+# in a queue far longer than that. Run those calls on a deadline so the user
+# always gets a reply instead of silence.
+SYNTH_BUDGET = float(os.environ.get("SYNTH_BUDGET_SECONDS")
+                     or (45 if SERVERLESS else 0))
+
+
+def with_budget(fn, label):
+    """Run fn(), raising TimeoutError once SYNTH_BUDGET seconds have passed."""
+    if not SYNTH_BUDGET:
+        return fn()
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # re-raised on the calling thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(SYNTH_BUDGET)
+    if thread.is_alive():
+        raise TimeoutError(
+            f"{label} was still queued after {SYNTH_BUDGET:.0f}s - the shared "
+            "GPU Space is busy right now. Try again in a moment, or /engine "
+            "fish for instant speech.")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def ensure_parent(path):
+    """State files live under /tmp on serverless, which starts empty."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
 
 
 def save_state(state):
@@ -352,6 +392,7 @@ def set_engine(chat_id, name):
     except Exception:
         pass
     data[str(chat_id)] = name
+    ensure_parent(ENGINES_FILE)
     with open(ENGINES_FILE, "w") as fh:
         json.dump(data, fh)
 
@@ -382,6 +423,7 @@ def set_speed(chat_id, value):
     except Exception:
         pass
     data[str(chat_id)] = value
+    ensure_parent(SPEEDS_FILE)
     with open(SPEEDS_FILE, "w") as fh:
         json.dump(data, fh)
 
@@ -737,12 +779,16 @@ def handle_message(token, api_key, model, voice, msg):
 
     try:
         if engine == "itts":
-            audio, used = synthesize_full_itts(
-                source_text, custom_ref(chat_id), speed=get_speed(chat_id))
+            audio, used = with_budget(
+                lambda: synthesize_full_itts(
+                    source_text, custom_ref(chat_id),
+                    speed=get_speed(chat_id)), "IndexTTS")
             fmt = "wav"
         elif engine == "auk":
-            audio, used = synthesize_full_auk(
-                source_text, custom_ref(chat_id), speed=get_speed(chat_id))
+            audio, used = with_budget(
+                lambda: synthesize_full_auk(
+                    source_text, custom_ref(chat_id),
+                    speed=get_speed(chat_id)), "AuK")
             fmt = "wav"
         else:
             chat_voice = get_fish_voice(chat_id) or voice
@@ -756,7 +802,9 @@ def handle_message(token, api_key, model, voice, msg):
         log(traceback.format_exc())
         msg_str = str(exc)
         low = msg_str.lower()
-        if "quota" in low or "zerogpu" in low or "runs limit" in low:
+        if isinstance(exc, TimeoutError):
+            reply(token, chat_id, msg_str)
+        elif "quota" in low or "zerogpu" in low or "runs limit" in low:
             reply(token, chat_id,
                   "AuK/IndexTTS GPU quota is used up for today (the HF Space "
                   "runs on shared ZeroGPU). It resets ~24h after your first GPU "
