@@ -168,8 +168,10 @@ def _blob_read(name):
     if not base:
         return None
     try:
+        # Cache-bust: blob reads are served with s-maxage=300, so the edge can
+        # hand back a copy that is minutes out of date after a write.
         req = urllib.request.Request(
-            f"{base}/{BLOB_PREFIX}/{name}",
+            f"{base}/{BLOB_PREFIX}/{name}?ts={int(now)}",
             headers={"authorization": f"Bearer {BLOB_TOKEN}"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.load(resp)
@@ -190,6 +192,7 @@ def _blob_write(name, data):
                 "x-content-type": "application/json",
                 "x-add-random-suffix": "0",
                 "x-allow-overwrite": "1",
+                "x-cache-control-max-age": "60",
             })
         with urllib.request.urlopen(req, timeout=20) as resp:
             try:
