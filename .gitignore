@@ -10,3 +10,4 @@ speeds.json
 
 .vercel
 .env*.local
+.env*
