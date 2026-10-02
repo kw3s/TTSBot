@@ -574,6 +574,21 @@ def reply(token, chat_id, text):
     })
 
 
+AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".ogg", ".oga", ".opus", ".flac", ".aac",
+              ".wma", ".mp4", ".webm")
+
+
+def looks_like_audio(doc):
+    """True when an uploaded document is an audio clip we can clone from.
+
+    Telegram delivers a .wav sent as a file as a document, not as a voice or
+    audio message, so the clone flow has to look inside documents too.
+    """
+    name = (doc.get("file_name") or "").lower()
+    mime = (doc.get("mime_type") or "").lower()
+    return mime.startswith("audio/") or name.endswith(AUDIO_EXTS)
+
+
 def handle_message(token, api_key, model, voice, msg):
     chat_id = msg["chat"]["id"]
     user = msg.get("from", {}).get("first_name", "there")
@@ -648,8 +663,9 @@ def handle_message(token, api_key, model, voice, msg):
         elif cmd in ("/clone", "/setvoice"):
             PENDING_VOICE.add(chat_id)
             reply(token, chat_id,
-                  "Send me a voice message or audio clip now - about 5-30 "
-                  "seconds of clean speech from the person to clone.\n"
+                  "Send me the voice now - a voice message, an audio file, or "
+                  "a .wav/.mp3 sent as a file. About 5-30 seconds of clean "
+                  "speech from the person to clone.\n"
                   "I'll clone it on both engines and send you samples, then "
                   "you choose which to activate.\n/cancel to abort.")
         elif cmd == "/usefish":
@@ -735,8 +751,12 @@ def handle_message(token, api_key, model, voice, msg):
         return
 
     # custom-voice capture: clone on both engines, send samples
-    if chat_id in PENDING_VOICE and (msg.get("voice") or msg.get("audio")):
-        src = msg.get("voice") or msg.get("audio")
+    src = msg.get("voice") or msg.get("audio")
+    if not src and chat_id in PENDING_VOICE:
+        candidate = msg.get("document")
+        if candidate and looks_like_audio(candidate):
+            src = candidate
+    if chat_id in PENDING_VOICE and src:
         PENDING_VOICE.discard(chat_id)
         try:
             ffmpeg = ffmpeg_bin()
@@ -840,8 +860,13 @@ def handle_message(token, api_key, model, voice, msg):
         mime = doc.get("mime_type", "")
         ok_ext = name.lower().endswith((".txt", ".md", ".csv", ".log"))
         if not (ok_ext or mime.startswith("text/")):
-            reply(token, chat_id, f"'{name}' doesn't look like a text file "
-                                  "(.txt/.md/csv/log only).")
+            if looks_like_audio(doc):
+                reply(token, chat_id,
+                      f"'{name}' is an audio file - send /clone first, then "
+                      "send it, and I'll clone the voice in it.")
+            else:
+                reply(token, chat_id, f"'{name}' doesn't look like a text file "
+                                      "(.txt/.md/.csv/.log only).")
             return
         if doc.get("file_size", 0) > 10_000_000:
             reply(token, chat_id, "File too large (max ~10 MB of text).")
