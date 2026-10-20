@@ -108,6 +108,11 @@ def with_budget(fn, label):
     thread.start()
     thread.join(SYNTH_BUDGET)
     if thread.is_alive():
+        if label == "Fish":
+            raise TimeoutError(
+                f"Fish was still working after {SYNTH_BUDGET:.0f}s - the "
+                "Fish API is slow right now. Try again in a moment, or "
+                "send a shorter text.")
         raise TimeoutError(
             f"{label} was still queued after {SYNTH_BUDGET:.0f}s - the shared "
             "GPU Space is busy right now. Try again in a moment, or /engine "
@@ -942,8 +947,12 @@ def handle_message(token, api_key, model, voice, msg):
             fmt = "wav"
         else:
             chat_voice = get_fish_voice(chat_id) or voice
-            audio, used = synthesize_full(source_text, api_key, model,
-                                          chat_voice)
+            # Fish must be deadline-bounded too: its API timeout is 120s but
+            # Vercel kills the invocation at 60s, so an unbounded slow call
+            # died in silence after the "One sec..." reply.
+            audio, used = with_budget(
+                lambda: synthesize_full(source_text, api_key, model,
+                                        chat_voice), "Fish")
             fmt = "mp3"
     except SystemExit as exc:
         # tts.py's CLI paths call sys.exit(); convert so the webhook survives
