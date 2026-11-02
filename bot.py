@@ -13,6 +13,7 @@ Run:
 """
 
 import auk
+import paradee as paradee_engine
 import base64
 import io
 import json
@@ -60,6 +61,10 @@ AUK_MAX_CHUNKS = _cap(1 if SERVERLESS else 4, "AUK_MAX_CHUNKS")
 AUK_CHUNK = _cap(300, "AUK_CHUNK")
 AUK_VARIANT = os.environ.get("AUK_VARIANT", "flash")
 AUK_USE_PE = os.environ.get("AUK_USE_PE", "").strip().lower() in ("1", "true", "yes")
+# Paradee is a tiny local model served by paradee_server.py (it cannot run
+# inside Vercel), so chunks can be fish-sized; it is fast once warm.
+PARADEE_MAX_CHUNKS = _cap(8 if SERVERLESS else 30, "PARADEE_MAX_CHUNKS")
+PARADEE_VOICE = os.environ.get("PARADEE_VOICE", "af_heart")
 
 # Per-engine (chunk_chars, max_chunks). Counting and synthesis must use the
 # same chunk size, otherwise truncation warnings lie and text is silently cut.
@@ -67,6 +72,7 @@ ENGINE_LIMITS = {
     "auk": (AUK_CHUNK, AUK_MAX_CHUNKS),
     "itts": (MAX_CHUNK, ITT_MAX_CHUNKS),
     "fish": (MAX_CHUNK, MAX_CHUNKS),
+    "paradee": (MAX_CHUNK, PARADEE_MAX_CHUNKS),
 }
 
 
@@ -511,6 +517,24 @@ def synthesize_full_auk(text, ref_path, speed=1.0):
     return concat_wavs(parts), len(chunks)
 
 
+# ---------- Paradee engine (self-hosted local model) ----------
+
+def synthesize_full_paradee(text, speed=1.0):
+    """Paradee speaks with fixed built-in voices - there is no reference
+    clip and no cloning; the voice is PARADEE_VOICE (default af_heart).
+    Audio comes from paradee_server.py via the paradee.py client."""
+    chunk_size, max_chunks = get_engine_limits("paradee")
+    chunks = split_text(text, chunk_size)[:max_chunks]
+    parts = []
+    for i, chunk in enumerate(chunks, 1):
+        log(f"paradee chunk {i}/{len(chunks)}")
+        parts.append(paradee_engine.generate(
+            chunk, voice=PARADEE_VOICE, speed=speed))
+    if len(parts) == 1:
+        return parts[0], 1
+    return concat_wavs(parts), len(chunks)
+
+
 # ---------- engine preference (per chat) ----------
 
 def get_engine(chat_id):
@@ -625,7 +649,8 @@ def handle_message(token, api_key, model, voice, msg):
                   "/engine - show current engine\n"
                   "/engine fish - Fish Audio s2.1 (free, fast)\n"
                   f"/engine itts - IndexTTS-2.5 voice clone ({ITT_MAX_CHUNKS * MAX_CHUNK // 3} chars max)\n"
-                  f"/engine auk - Tencent AuK voice clone ({AUK_MAX_CHUNKS * AUK_CHUNK // 3} chars max)\n\n"
+                  f"/engine auk - Tencent AuK voice clone ({AUK_MAX_CHUNKS * AUK_CHUNK // 3} chars max)\n"
+                  f"/engine paradee - Paradee local voice, no clone ({PARADEE_MAX_CHUNKS * MAX_CHUNK // 3} chars max)\n\n"
                   "<b>Voice cloning</b>\n"
                   "/clone - send a voice message after this (~5-30s clean "
                   "speech); I'll clone it on all three engines and send samples\n"
@@ -643,10 +668,10 @@ def handle_message(token, api_key, model, voice, msg):
                 cur = get_engine(chat_id)
                 reply(token, chat_id,
                       f"Current engine: <b>{cur}</b>.\n"
-                      "Switch with /engine fish, /engine itts or /engine auk")
-            elif parts[1].strip().lower() in ("fish", "itts", "indextts", "auk"):
+                      "Switch with /engine fish, /engine itts, /engine auk or /engine paradee")
+            elif parts[1].strip().lower() in ("fish", "itts", "indextts", "auk", "paradee"):
                 want = parts[1].strip().lower()
-                name = "itts" if want.startswith("i") else ("auk" if want.startswith("a") else "fish")
+                name = ("itts" if want.startswith("i") else "auk" if want.startswith("a") else "paradee" if want.startswith("p") else "fish")
                 set_engine(chat_id, name)
                 ref_note = ""
                 has_custom = os.path.exists(os.path.join(REF_DIR, f"custom_{chat_id}.wav"))
@@ -659,7 +684,7 @@ def handle_message(token, api_key, model, voice, msg):
                 reply(token, chat_id, f"Engine set to <b>{name}</b>.{ref_note}")
             else:
                 reply(token, chat_id,
-                      "Unknown engine. Use /engine fish, /engine itts or /engine auk")
+                      "Unknown engine. Use /engine fish, /engine itts, /engine auk or /engine paradee")
         elif cmd == "/speed":
             parts = text_in.split(maxsplit=1)
             if len(parts) == 1:
@@ -919,6 +944,9 @@ def handle_message(token, api_key, model, voice, msg):
     elif engine == "auk":
         limit_note = (f"That's ~{total_chunks} chunks but AuK can only do "
                       f"{AUK_MAX_CHUNKS} per request - I'll read the first part only.")
+    elif engine == "paradee":
+        limit_note = (f"That's ~{total_chunks} chunks but Paradee can only do "
+                      f"{PARADEE_MAX_CHUNKS} per request - I'll read the first part only.")
     else:
         limit_note = (f"That's ~{total_chunks} chunks but I can only do "
                       f"{MAX_CHUNKS} per request - I'll read the first part only.")
@@ -944,6 +972,11 @@ def handle_message(token, api_key, model, voice, msg):
                 lambda: synthesize_full_auk(
                     source_text, custom_ref(chat_id),
                     speed=get_speed(chat_id)), "AuK")
+            fmt = "wav"
+        elif engine == "paradee":
+            audio, used = with_budget(
+                lambda: synthesize_full_paradee(
+                    source_text, speed=get_speed(chat_id)), "Paradee")
             fmt = "wav"
         else:
             chat_voice = get_fish_voice(chat_id) or voice
